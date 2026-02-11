@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
 import io
+from datetime import timedelta
 
 # --- 1. KONFIGURACE ---
-st.set_page_config(page_title="Inventory Matcher", page_icon="🔍", layout="wide")
+st.set_page_config(page_title="Inventory Matcher v2.0", page_icon="🔍", layout="wide")
 
 st.markdown("""
     <style>
@@ -17,29 +18,44 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🔍 Inventory Matcher")
-st.markdown("Doplnění uživatele a času k inventurním rozdílům z LT24.")
+st.title("🔍 Inventory Matcher v2.0")
+st.markdown("Diagnostika a párování inventurních rozdílů.")
 
 # --- 2. SIDEBAR ---
 with st.sidebar:
     st.header("Vstupní data")
     file_inv = st.file_uploader("1. Inventurní rozdíly (INV.xlsx)", type=['xlsx', 'csv'])
     file_lt24 = st.file_uploader("2. Export z LT24 (LT24.xlsx)", type=['xlsx', 'csv'])
-    st.info("Aplikace spáruje řádky na základě: Materiálu, Data a Množství.")
+    
+    st.markdown("---")
+    st.header("Nastavení párování")
+    date_tolerance = st.checkbox("Povolit toleranci data ±1 den", value=True, help="Užitečné, pokud se potvrzení v LT24 a zaúčtování v INV liší o půlnoc.")
 
-# --- 3. LOGIKA PÁROVÁNÍ ---
-def clean_material(val):
-    """Odstraní nuly na začátku a převede na string pro lepší párování."""
+# --- 3. ROBUSTNÍ FUNKCE ---
+def normalize_material(val):
+    """Převede materiál na čistý string bez .0 a mezer."""
     if pd.isna(val): return ""
-    return str(val).strip()
+    s = str(val).strip()
+    # Pokud excel načetl číslo jako float (např. 12345.0), odstraníme .0
+    if s.endswith('.0'):
+        s = s[:-2]
+    return s
 
 def normalize_date(val):
-    """Převede datum na standardní datetime.date object."""
+    """Bezpečný převod na date objekt."""
     if pd.isna(val): return None
     try:
         return pd.to_datetime(val).date()
     except:
         return None
+
+def normalize_qty(val):
+    """Absolutní hodnota float."""
+    if pd.isna(val): return 0.0
+    try:
+        return abs(float(val))
+    except:
+        return 0.0
 
 if file_inv and file_lt24:
     try:
@@ -47,152 +63,150 @@ if file_inv and file_lt24:
         df_inv = pd.read_csv(file_inv) if file_inv.name.endswith('.csv') else pd.read_excel(file_inv)
         df_lt24 = pd.read_csv(file_lt24) if file_lt24.name.endswith('.csv') else pd.read_excel(file_lt24)
 
-        # --- PŘÍPRAVA INV (Cíl) ---
-        # Očekávané sloupce v INV: 'Material', 'Menge in ErfassME', 'Buchungsdatum'
-        # Pokud se jmenují jinak, pokusíme se je najít
-        col_mat_inv = 'Material'
-        col_qty_inv = 'Menge in ErfassME'
-        col_date_inv = 'Buchungsdatum'
+        # Očištění názvů sloupců (strip whitespace)
+        df_inv.columns = [str(c).strip() for c in df_inv.columns]
+        df_lt24.columns = [str(c).strip() for c in df_lt24.columns]
 
-        # Převody pro párování
-        df_inv['Match_Mat'] = df_inv[col_mat_inv].apply(clean_material)
-        df_inv['Match_Date'] = df_inv[col_date_inv].apply(normalize_date)
-        df_inv['Match_Qty'] = df_inv[col_qty_inv].abs() # Absolutní hodnota (ignorováni znaménka)
-
-        # --- PŘÍPRAVA LT24 (Zdroj) ---
-        # Očekávané sloupce: 'Material', 'Confirmation date', 'User', 'Confirmation time', 'Source target qty'
-        col_mat_lt = 'Material'
-        col_date_lt = 'Confirmation date'
+        # --- A. PŘÍPRAVA INV (Cíl) ---
+        # Hledání klíčových sloupců
+        inv_map = {
+            'Mat': 'Material',
+            'Qty': next((c for c in df_inv.columns if 'Menge' in c or 'Qty' in c), 'Menge in ErfassME'),
+            'Date': next((c for c in df_inv.columns if 'datum' in c.lower() or 'Date' in c), 'Buchungsdatum')
+        }
         
-        # Množství v LT24 může být ve více sloupcích, vezmeme 'Source target qty' nebo 'Dest.target quantity'
-        # Vytvoříme pomocný sloupec s max hodnotou množství na řádku
+        df_inv['Key_Mat'] = df_inv[inv_map['Mat']].apply(normalize_material)
+        df_inv['Key_Date'] = df_inv[inv_map['Date']].apply(normalize_date)
+        df_inv['Key_Qty'] = df_inv[inv_map['Qty']].apply(normalize_qty)
+
+        # --- B. PŘÍPRAVA LT24 (Zdroj) ---
+        lt_map = {
+            'Mat': 'Material',
+            'Date': 'Confirmation date',
+            'User': 'User',
+            'Time': 'Confirmation time',
+            'TO': 'Transfer Order Number'
+        }
+        
+        # Hledání množství v LT24 (může být Source nebo Dest target qty)
         qty_cols_lt = [c for c in df_lt24.columns if 'target qty' in c.lower() or 'target quantity' in c.lower()]
         if not qty_cols_lt:
-            st.error("V souboru LT24 nebyl nalezen sloupec s množstvím (Target Qty).")
+            st.error("V LT24 nebyl nalezen sloupec s množstvím (Source/Dest target qty).")
             st.stop()
             
-        df_lt24['Match_Mat'] = df_lt24[col_mat_lt].apply(clean_material)
-        df_lt24['Match_Date'] = df_lt24[col_date_lt].apply(normalize_date)
-        # Vezme maximální množství z nalezených sloupců (obvykle jedno je 0 a druhé je hodnota)
-        df_lt24['Match_Qty'] = df_lt24[qty_cols_lt].max(axis=1)
+        df_lt24['Key_Mat'] = df_lt24[lt_map['Mat']].apply(normalize_material)
+        df_lt24['Key_Date'] = df_lt24[lt_map['Date']].apply(normalize_date)
+        # Vezmeme max hodnotu z nalezených qty sloupců
+        df_lt24['Key_Qty'] = df_lt24[qty_cols_lt].apply(lambda x: abs(pd.to_numeric(x, errors='coerce')).max(), axis=1).fillna(0)
 
-        # Vybereme jen potřebné sloupce z LT24 pro zrychlení a vytvoříme kopii
-        lt24_pool = df_lt24[['Match_Mat', 'Match_Date', 'Match_Qty', 'User', 'Confirmation time', 'Transfer Order Number']].copy()
-        
-        # Přidáme sloupec 'Used' do LT24, abychom nepoužili stejný záznam 2x pro různé řádky v INV
+        # Filtrujeme jen užitečné řádky z LT24 pro zrychlení
+        lt24_pool = df_lt24[['Key_Mat', 'Key_Date', 'Key_Qty', lt_map['User'], lt_map['Time'], lt_map['TO']]].copy()
         lt24_pool['Used'] = False
 
-        # --- VLASTNÍ ALGORITMUS PÁROVÁNÍ ---
-        # Nemůžeme použít jednoduchý merge, protože můžeme mít 3 stejné odpisy ve stejný den.
-        # Musíme iterovat a "odškrtávat" použité řádky z LT24.
-        
+        # --- C. DIAGNOSTIKA (Zobrazit náhled klíčů před párováním) ---
+        with st.expander("🕵️ Diagnostika klíčů (Pokud se nic nepáruje, podívejte se sem)"):
+            c1, c2 = st.columns(2)
+            c1.write("**INV data (hledáme toto):**")
+            c1.dataframe(df_inv[['Key_Mat', 'Key_Date', 'Key_Qty']].head())
+            c2.write("**LT24 data (hledáme v tomto):**")
+            c2.dataframe(lt24_pool[['Key_Mat', 'Key_Date', 'Key_Qty']].head())
+            st.caption("Zkontrolujte, zda formáty Materiálu (např. nuly na začátku) a Data vypadají stejně.")
+
+        # --- D. PÁROVÁNÍ ---
         results_user = []
         results_time = []
         results_to = []
-        status = []
+        status_list = []
 
-        # Progress bar
         progress_bar = st.progress(0)
-        total_rows = len(df_inv)
+        total = len(df_inv)
 
-        for index, row in df_inv.iterrows():
-            # Filtrujeme LT24 podle shody Materiálu, Data a Množství
-            # A zároveň nesmí být už použitý ('Used' == False)
-            match = lt24_pool[
-                (lt24_pool['Match_Mat'] == row['Match_Mat']) &
-                (lt24_pool['Match_Date'] == row['Match_Date']) &
-                (lt24_pool['Match_Qty'] == row['Match_Qty']) &
+        for i, row in df_inv.iterrows():
+            target_mat = row['Key_Mat']
+            target_date = row['Key_Date']
+            target_qty = row['Key_Qty']
+
+            # Filtrování
+            # 1. Shoda Materiálu a Množství
+            candidates = lt24_pool[
+                (lt24_pool['Key_Mat'] == target_mat) &
+                (lt24_pool['Key_Qty'] == target_qty) &
                 (lt24_pool['Used'] == False)
             ]
 
+            # 2. Shoda Data (s tolerancí nebo bez)
+            match = pd.DataFrame()
+            if not candidates.empty:
+                if date_tolerance and target_date:
+                    # Datum ± 1 den
+                    mask = (candidates['Key_Date'] >= target_date - timedelta(days=1)) & \
+                           (candidates['Key_Date'] <= target_date + timedelta(days=1))
+                    match = candidates[mask]
+                else:
+                    # Přesné datum
+                    match = candidates[candidates['Key_Date'] == target_date]
+
+            # Výsledek
             if not match.empty:
-                # Našli jsme shodu (vezmeme první nalezený záznam)
-                found_row = match.iloc[0]
-                results_user.append(found_row['User'])
-                results_time.append(found_row['Confirmation time'])
-                results_to.append(found_row['Transfer Order Number'])
-                status.append("Nalezeno")
+                # Našli jsme
+                found = match.iloc[0]
+                results_user.append(found[lt_map['User']])
+                results_time.append(found[lt_map['Time']])
+                results_to.append(found[lt_map['TO']])
+                status_list.append("Nalezeno")
                 
-                # Označíme v poolu jako použité (podle indexu původního LT24 poolu)
-                lt24_pool.at[found_row.name, 'Used'] = True
+                # Označit jako použité
+                lt24_pool.at[found.name, 'Used'] = True
             else:
-                # Nenašli jsme shodu
-                results_user.append("Nenalezeno")
+                results_user.append("")
                 results_time.append("")
                 results_to.append("")
-                status.append("Chybí v LT24")
+                status_list.append("Nenalezeno")
             
-            if index % 10 == 0:
-                progress_bar.progress(min((index + 1) / total_rows, 1.0))
+            if i % 20 == 0:
+                progress_bar.progress(min((i + 1) / total, 1.0))
         
         progress_bar.empty()
 
-        # Zapsání výsledků do DF
+        # Uložení do DF
         df_inv['User (LT24)'] = results_user
         df_inv['Time (LT24)'] = results_time
         df_inv['TO Number'] = results_to
-        df_inv['Status'] = status
-        
-        # Přidání prázdného sloupce pro Důvod (aby ho uživatel mohl doplnit v Excelu)
+        df_inv['Status'] = status_list
         df_inv['Důvod (Doplnit)'] = ""
 
-        # Úklid pomocných sloupců
-        df_final = df_inv.drop(columns=['Match_Mat', 'Match_Date', 'Match_Qty'])
+        # --- E. VÝSLEDKY ---
+        st.subheader("📊 Výsledek")
+        found_cnt = status_list.count("Nalezeno")
+        st.metric("Úspěšně spárováno", f"{found_cnt} / {total}", delta=f"{found_cnt/total:.0%}" if total else 0)
 
-        # --- VÝSLEDKY ---
-        st.subheader("📊 Výsledek párování")
-        
-        found_count = status.count("Nalezeno")
-        missing_count = status.count("Chybí v LT24")
-        
-        c1, c2 = st.columns(2)
-        c1.metric("Úspěšně spárováno", found_count)
-        c2.metric("Nenalezeno", missing_count, delta_color="inverse")
+        # Zobrazit jen nespárované pro kontrolu
+        if found_cnt < total:
+            with st.expander("Zobrazit nespárované řádky"):
+                st.dataframe(df_inv[df_inv['Status'] == "Nenalezeno"])
 
-        st.dataframe(
-            df_final, 
-            use_container_width=True,
-            column_config={
-                "Status": st.column_config.TextColumn(
-                    "Stav",
-                    help="Výsledek hledání v LT24",
-                    width="medium",
-                ),
-            }
-        )
+        # Export
+        # Odstraníme pomocné klíče z exportu
+        df_export = df_inv.drop(columns=['Key_Mat', 'Key_Date', 'Key_Qty'])
 
-        # --- EXPORT ---
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            df_final.to_excel(writer, index=False, sheet_name="Inventory_Matched")
-            ws = writer.sheets['Inventory_Matched']
+            df_export.to_excel(writer, index=False, sheet_name="Matched_Inventory")
+            ws = writer.sheets['Matched_Inventory']
             
             # Formátování
-            # Zvýraznění sloupce User a Důvod
-            format_yellow = writer.book.add_format({'bg_color': '#FFF9C4', 'border': 1})
-            format_header = writer.book.add_format({'bold': True, 'border': 1})
+            fmt_yellow = writer.book.add_format({'bg_color': '#FFF9C4', 'border': 1})
             
-            # Najdeme indexy sloupců
-            user_col_idx = df_final.columns.get_loc('User (LT24)')
-            reason_col_idx = df_final.columns.get_loc('Důvod (Doplnit)')
-            
-            ws.set_column(user_col_idx, user_col_idx, 20, format_yellow)
-            ws.set_column(reason_col_idx, reason_col_idx, 40, format_yellow)
-            
-            # Auto-fit (zjednodušený)
-            for i, col in enumerate(df_final.columns):
-                ws.set_column(i, i, 20)
+            try:
+                col_u = df_export.columns.get_loc('User (LT24)')
+                col_d = df_export.columns.get_loc('Důvod (Doplnit)')
+                ws.set_column(col_u, col_u, 15, fmt_yellow)
+                ws.set_column(col_d, col_d, 40, fmt_yellow)
+            except:
+                pass
 
-        st.download_button(
-            label="📥 Stáhnout Spárovaný Excel",
-            data=buffer.getvalue(),
-            file_name="Inventura_Doplneno.xlsx",
-            mime="application/vnd.ms-excel"
-        )
+        st.download_button("📥 Stáhnout Výsledek (.xlsx)", buffer.getvalue(), "Inventura_Sparovano.xlsx")
 
     except Exception as e:
-        st.error(f"Chyba při zpracování: {e}")
-        st.write("Zkontrolujte, zda soubory mají správnou strukturu (sloupce Material, Buchungsdatum/Confirmation date atd.)")
-
-else:
-    st.info("Nahrajte prosím oba soubory (INV.xlsx a LT24.xlsx).")
+        st.error(f"Chyba: {e}")
+        st.write("Tip: Zkontrolujte sekci 'Diagnostika klíčů' výše.")
