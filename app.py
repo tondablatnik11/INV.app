@@ -4,7 +4,7 @@ import io
 from datetime import timedelta
 
 # --- 1. KONFIGURACE ---
-st.set_page_config(page_title="Inventory Matcher v6.0", page_icon="🕵️", layout="wide")
+st.set_page_config(page_title="Inventory Matcher v8.0", page_icon="📆", layout="wide")
 
 st.markdown("""
     <style>
@@ -12,39 +12,37 @@ st.markdown("""
     [data-testid="stSidebar"] { background-color: #161b22; }
     h1 { color: #58a6ff !important; font-family: 'Inter', sans-serif; }
     .stDataFrame { border: 1px solid #30363d; border-radius: 8px; }
-    .stButton>button { background-color: #238636; color: white; border-radius: 6px; width: 100%; }
+    .stButton>button { background-color: #238636; color: white; border-radius: 6px; width: 100%; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🕵️ Inventory Matcher v6.0 (User Fix)")
-st.markdown("Oprava načítání uživatelů a párování plusových/mínusových položek.")
+st.title("📆 Inventory Matcher v8.0")
+st.markdown("Párování podle **Creation Date** (Datum vytvoření).")
 
-# --- 2. ČISTÍCÍ FUNKCE ---
-def normalize_material(val):
-    if pd.isna(val): return ""
-    s = str(val).strip()
+# --- 2. FUNKCE PRO ČIŠTĚNÍ ---
+def super_clean_mat(val):
+    """Převede na string, odstraní mezery, nuly na začátku i konci, tečky."""
+    if pd.isna(val): return "MISSING"
+    s = str(val).upper().strip()
     if s.endswith(".0"): s = s[:-2]
-    return s.upper()
+    s = s.replace(" ", "")
+    return s
 
-def normalize_date(val):
-    if pd.isna(val): return None
-    try: return pd.to_datetime(val).date()
-    except: return None
-
-def normalize_qty(val):
+def super_clean_qty(val):
+    """Absolutní hodnota float."""
     if pd.isna(val): return 0.0
     try:
         s = str(val).replace(",", ".").replace(" ", "")
         return abs(float(s))
-    except: return 0.0
+    except:
+        return 0.0
 
-def get_smart_user(row, user_cols):
-    """Projdu všechny sloupce s názvem 'User' a vrátím první neprázdný."""
-    for col in user_cols:
-        val = row[col]
-        if pd.notna(val) and str(val).strip() != "":
-            return str(val).strip()
-    return "Neznámý"
+def super_clean_date(val):
+    if pd.isna(val): return None
+    try:
+        return pd.to_datetime(val).date()
+    except:
+        return None
 
 def determine_type(bin_val):
     if pd.isna(bin_val): return ""
@@ -53,14 +51,23 @@ def determine_type(bin_val):
     if any(char.isdigit() for char in s): return "Inventura"
     return "Jiný"
 
-# --- 3. UI ---
+def get_smart_user(row, columns):
+    """Najde první neprázdný sloupec s názvem User."""
+    for col in columns:
+        if 'user' in col.lower():
+            val = row[col]
+            if pd.notna(val) and str(val).strip() != "":
+                return str(val)
+    return ""
+
+# --- 3. UI APLIKACE ---
 with st.sidebar:
-    st.header("Vstupní data")
+    st.header("1. Vstupní data")
     file_inv = st.file_uploader("INV.xlsx", type=['xlsx', 'csv'])
     file_lt24 = st.file_uploader("LT24.xlsx", type=['xlsx', 'csv'])
     
     st.markdown("---")
-    date_tolerance = st.checkbox("Tolerance data ±1 den", value=True)
+    st.info("Nyní se v LT24 používá 'Creation Date'.")
 
 if file_inv and file_lt24:
     try:
@@ -73,137 +80,160 @@ if file_inv and file_lt24:
         df_lt24.columns = [str(c).strip() for c in df_lt24.columns]
 
         # --- DETEKCE SLOUPCŮ ---
-        # 1. Množství v LT24 (Vezmeme max ze všech target qty sloupců pro každý řádek)
-        # To řeší problém, zda je množství v Source nebo Dest sloupci
-        qty_cols_lt = [c for c in df_lt24.columns if 'target' in c.lower() and 'qty' in c.lower()]
-        if not qty_cols_lt:
-            st.error("Chyba: V LT24 chybí sloupce s množstvím (Target Qty).")
+        # INV
+        col_inv_mat = 'Material'
+        col_inv_qty = 'Menge in ErfassME'
+        col_inv_date = 'Buchungsdatum'
+
+        # LT24 - ZMĚNA: Hledáme Creation Date
+        # Zkusíme najít přesný název nebo něco podobného
+        col_lt_date = None
+        for c in df_lt24.columns:
+            if "creation" in c.lower() and "date" in c.lower():
+                col_lt_date = c
+                break
+        
+        if not col_lt_date:
+            st.error("CHYBA: V LT24 nebyl nalezen sloupec 'Creation Date'. Zkontrolujte soubor.")
             st.stop()
-        
-        # 2. User sloupce v LT24 (Všechny, co obsahují "User")
-        user_cols_lt = [c for c in df_lt24.columns if 'user' in c.lower()]
-        
-        # 3. Time sloupce
-        time_cols_lt = [c for c in df_lt24.columns if 'time' in c.lower() and 'creation' not in c.lower()]
-        col_lt_time = time_cols_lt[0] if time_cols_lt else 'Confirmation time'
-        
-        # 4. Storage Bin
+        else:
+            st.sidebar.success(f"LT24 Datum: {col_lt_date}")
+
+        col_lt_mat = 'Material'
         col_lt_bin = 'Dest.Storage Bin' if 'Dest.Storage Bin' in df_lt24.columns else df_lt24.columns[6] # Fallback
 
+        # Množství v LT24 (Target Qty)
+        qty_cols = [c for c in df_lt24.columns if 'target' in c.lower() and 'qty' in c.lower()]
+        if not qty_cols:
+             st.error("CHYBA: V LT24 chybí sloupce 'Target Qty'.")
+             st.stop()
+
         # --- PŘÍPRAVA KLÍČŮ ---
-        # INV
-        df_inv['K_Mat'] = df_inv['Material'].apply(normalize_material)
-        df_inv['K_Date'] = df_inv['Buchungsdatum'].apply(normalize_date)
-        df_inv['K_Qty'] = df_inv['Menge in ErfassME'].apply(normalize_qty) # Absolutní hodnota
+        df_inv['MATCH_MAT'] = df_inv[col_inv_mat].apply(super_clean_mat)
+        df_inv['MATCH_QTY'] = df_inv[col_inv_qty].apply(super_clean_qty)
+        df_inv['MATCH_DATE'] = df_inv[col_inv_date].apply(super_clean_date)
 
-        # LT24
-        df_lt24['K_Mat'] = df_lt24['Material'].apply(normalize_material)
-        df_lt24['K_Date'] = df_lt24['Confirmation date'].apply(normalize_date)
-        # Vypočítáme maximální množství na řádku (abychom chytili správné číslo nezávisle na sloupci)
-        df_lt24['K_Qty'] = df_lt24[qty_cols_lt].apply(lambda x: x.apply(normalize_qty).max(), axis=1)
+        df_lt24['MATCH_MAT'] = df_lt24[col_lt_mat].apply(super_clean_mat)
+        df_lt24['MATCH_DATE'] = df_lt24[col_lt_date].apply(super_clean_date)
+        # Max množství z target sloupců
+        df_lt24['MATCH_QTY'] = df_lt24[qty_cols].apply(lambda x: x.apply(super_clean_qty).max(), axis=1)
 
-        # LT24 Pool
-        lt_pool = df_lt24.copy()
-        lt_pool['Used'] = False
+        # --- DIAGNOSTIKA ---
+        with st.expander("🕵️ RENTGEN DAT (Klikni pro kontrolu)", expanded=False):
+            c1, c2 = st.columns(2)
+            c1.write("### INV (Cíl)")
+            c1.dataframe(df_inv[['MATCH_MAT', 'MATCH_QTY', 'MATCH_DATE']].head())
+            c2.write("### LT24 (Zdroj)")
+            c2.dataframe(df_lt24[['MATCH_MAT', 'MATCH_QTY', 'MATCH_DATE']].head())
 
         # --- PÁROVÁNÍ ---
-        results = {'User': [], 'Time': [], 'Type': [], 'Status': []}
+        lt_pool = df_lt24.copy()
+        lt_pool['Used'] = False
+        
+        results_user = []
+        results_time = []
+        results_type = []
+        status_list = []
         
         prog = st.progress(0)
         total = len(df_inv)
+        matches = 0
 
         for i, row in df_inv.iterrows():
-            mat = row['K_Mat']
-            qty = row['K_Qty']
-            date = row['K_Date']
+            mat = row['MATCH_MAT']
+            qty = row['MATCH_QTY']
+            date = row['MATCH_DATE']
 
-            # 1. Najít kandidáty (Shoda Mat, Qty a Nepoužité)
-            # Tady seQty == Qty postará o shodu (protože máme absolutní hodnoty na obou stranách)
+            # 1. Shoda Mat + Qty + Nepoužité
             candidates = lt_pool[
-                (lt_pool['K_Mat'] == mat) &
-                (lt_pool['K_Qty'] == qty) &
+                (lt_pool['MATCH_MAT'] == mat) & 
+                (lt_pool['MATCH_QTY'] == qty) & 
                 (lt_pool['Used'] == False)
             ]
 
-            match = pd.DataFrame()
+            final_match = pd.DataFrame()
+            found_status = "Nenalezeno"
 
-            # 2. Filtr Data
             if not candidates.empty:
+                # 2. Shoda Datum ± 1 den (nyní podle Creation Date)
                 if date:
-                    if date_tolerance:
-                        start = date - timedelta(days=1)
-                        end = date + timedelta(days=1)
-                        match = candidates[(candidates['K_Date'] >= start) & (candidates['K_Date'] <= end)]
+                    start = date - timedelta(days=1)
+                    end = date + timedelta(days=1)
+                    date_match = candidates[(candidates['MATCH_DATE'] >= start) & (candidates['MATCH_DATE'] <= end)]
+                    
+                    if not date_match.empty:
+                        final_match = date_match.iloc[[0]]
+                        found_status = "Nalezeno"
                     else:
-                        match = candidates[candidates['K_Date'] == date]
+                        # Datum nesedí, ale materiál ano -> Bereme to jako "částečnou shodu" nebo nic?
+                        # Zde pro jistotu bereme i shodu bez data, pokud je to jediná možnost
+                        # (Můžete zakomentovat, pokud chcete striktní datum)
+                        final_match = candidates.iloc[[0]] 
+                        found_status = "Nalezeno (Datum nesedí)"
                 else:
-                    match = candidates # Bez data
-            
-            # 3. Výsledek
-            if not match.empty:
-                found = match.iloc[0]
+                     final_match = candidates.iloc[[0]]
+                     found_status = "Nalezeno"
+
+            if not final_match.empty:
+                found = final_match.iloc[0]
                 
-                # Získání Usera (iterace přes všechny user sloupce)
-                u_val = get_smart_user(found, user_cols_lt)
-                t_val = found[col_lt_time] if col_lt_time in found else ""
-                b_val = found[col_lt_bin] if col_lt_bin in found else ""
+                # Získání dat
+                u = get_smart_user(found, df_lt24.columns)
                 
-                results['User'].append(u_val)
-                results['Time'].append(t_val)
-                results['Type'].append(determine_type(b_val))
-                results['Status'].append("Nalezeno")
+                # Čas (obvykle Creation time nebo Confirmation time)
+                # Zkusíme Creation time, pokud tam je
+                t_cols = [c for c in df_lt24.columns if 'time' in c.lower()]
+                t = found[t_cols[0]] if t_cols else ""
                 
-                # Odškrtnout
+                b = found[col_lt_bin] if col_lt_bin in found else ""
+                
+                results_user.append(u)
+                results_time.append(t)
+                results_type.append(determine_type(b))
+                status_list.append(found_status)
+                
                 lt_pool.at[found.name, 'Used'] = True
+                matches += 1
             else:
-                results['User'].append("")
-                results['Time'].append("")
-                results['Type'].append("")
-                results['Status'].append("Nenalezeno")
+                results_user.append("")
+                results_time.append("")
+                results_type.append("")
+                status_list.append("Nenalezeno")
             
             if i % 20 == 0: prog.progress(min((i+1)/total, 1.0))
         
         prog.empty()
 
         # --- VÝSTUP ---
-        df_inv['User'] = results['User']
-        df_inv['Čas'] = results['Time']
-        df_inv['Typ pohybu'] = results['Type']
+        df_inv['User'] = results_user
+        df_inv['Čas'] = results_time
+        df_inv['Typ pohybu'] = results_type
+        df_inv['Status'] = status_list
         df_inv['Důvod (Vyplnit)'] = ""
-        
-        final_df = df_inv.drop(columns=['K_Mat', 'K_Date', 'K_Qty'])
-        
-        found_cnt = results['Status'].count("Nalezeno")
-        
-        st.divider()
-        c1, c2 = st.columns(2)
-        c1.metric("Spárováno", f"{found_cnt} / {total}")
-        
-        # Zobrazit náhled, pokud je User prázdný u nalezených
-        if found_cnt > 0:
-            empty_users = final_df[(final_df['Status']=="Nalezeno") & (final_df['User']=="Neznámý")]
-            if not empty_users.empty:
-                st.warning(f"Pozor: U {len(empty_users)} řádků byla nalezena shoda, ale sloupec User je prázdný. Zkontrolujte LT24.")
 
-        # --- EXPORT ---
+        # Úklid
+        final_df = df_inv.drop(columns=['MATCH_MAT', 'MATCH_QTY', 'MATCH_DATE'])
+
+        st.divider()
+        st.metric("✅ Spárováno", f"{matches} / {total}")
+
+        # EXPORT
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-            final_df.to_excel(writer, index=False, sheet_name="Final_Match")
-            ws = writer.sheets['Final_Match']
+            final_df.to_excel(writer, index=False, sheet_name="Result")
+            ws = writer.sheets['Result']
             
-            fmt_yellow = writer.book.add_format({'bg_color': '#FFF9C4', 'border': 1})
+            yellow = writer.book.add_format({'bg_color': '#FFF9C4', 'border': 1})
             
-            # Nastavení šířky a barev
-            target_cols = ['User', 'Čas', 'Typ pohybu', 'Důvod (Vyplnit)']
             for idx, col in enumerate(final_df.columns):
                 width = 15
                 fmt = None
-                if col in target_cols:
+                if col in ['User', 'Čas', 'Typ pohybu', 'Důvod (Vyplnit)']:
                     width = 25
-                    fmt = fmt_yellow
+                    fmt = yellow
                 ws.set_column(idx, idx, width, fmt)
 
-        st.download_button("📥 Stáhnout Opravený Excel", buffer.getvalue(), "Inventura_UserFix.xlsx")
+        st.download_button("📥 Stáhnout Excel", buffer.getvalue(), "Inventura_CreationDate.xlsx")
 
     except Exception as e:
         st.error(f"Chyba: {e}")
